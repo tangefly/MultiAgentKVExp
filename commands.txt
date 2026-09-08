@@ -1,0 +1,20 @@
+先启动实验服务，替换模型路径：
+
+cd /home/tanger/workspace/MultiAgentKVExp
+PYTHONPATH="$PWD/LMInfer" python3 -m lminfer serve /home/tanger/workspace/models/Qwen3-8B \
+    --served-model-name Qwen3-8B \
+    --max-model-len 40960 \
+    --reuse-agent-kv-append \
+    --graft-rope-rebase \
+    --repair-window-begin 0.1 \
+    --repair-window-end 0.1 \
+    --enable-auto-tool-choice \
+    --tool-call-parser hermes \
+    --port 8000
+
+再运行一个样本，一次得到两组结果：
+
+python3 /home/tanger/workspace/MultiAgentKVExp/BenchAgent/scripts/browsecomp/run_browsecomp.py \
+--base-url http://localhost:8000/v1 --model Qwen3-8B --index 0 \
+--temperature 0 --enable-thinking --sub-max-tokens 10240 \
+--sub-max-iters 4 --final-max-tokens 10240 --no-continue-on-error
