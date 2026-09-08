@@ -192,6 +192,73 @@ class SessionKVStoreTest(unittest.TestCase):
         self.assertEqual([g.position for g in grafts], [5])
         self.assertEqual([g.source_position for g in grafts], [3])
 
+    def test_build_grafts_excludes_leading_think_block(self):
+        store = SessionKVStore(config=None, tokenizer=FakeTokenizer())
+        session_id = "s1"
+        main_tokens = [1, 2, 3]
+        self.assertTrue(store.put(session_id, KIND_MAIN, main_tokens, make_cache(3), prompt_len=3))
+
+        answer = [101, 102, 103, 104, 105, 106]
+        # 输出以 <think> 块开头, think 内复述了完整答案(Qwen3 常见);
+        # 剔除 think 后 graft 必须落在真正的答案区域, 而不是 think 内的复述。
+        think = [201, 202] + answer + [203]
+        sub_seq = [7, 8] + think + answer
+        self.assertTrue(store.put(session_id, KIND_SUB, sub_seq, make_cache(len(sub_seq)),
+                                  prompt_len=2, think_len=len(think)))
+
+        prompt = main_tokens + [900] + answer + [901]
+        grafts = store.build_grafts(session_id, [KIND_MAIN, "sub", KIND_MAIN], prompt)
+
+        self.assertEqual([g.tokens for g in grafts], [answer])
+        self.assertEqual([g.position for g in grafts], [4])
+        # 源位置落在 think 块之后的真正输出区域
+        self.assertEqual([g.source_position for g in grafts], [2 + len(think)])
+
+    def test_build_grafts_anchors_document_order_within_boundary_drift(self):
+        store = SessionKVStore(config=None, tokenizer=FakeTokenizer())
+        session_id = "s1"
+        main_tokens = [1, 2, 3]
+        self.assertTrue(store.put(session_id, KIND_MAIN, main_tokens, make_cache(3), prompt_len=3))
+
+        # 窗口 1 的正文是 sub 1 的答案, 但 sub 1 首 token 因边界 BPE 合并丢失,
+        # 真实匹配只有 6 tok; sub 2 的输出恰好包含窗口 1 的完整正文(两个 sub
+        # 答案高度重合), 跨 sub 匹配达 7 tok。文档序锚定必须仍选 sub 1。
+        window1_body = [21, 22, 23, 24, 25, 26, 27]
+        sub1_out = [20, 22, 23, 24, 25, 26, 27]      # 首 token 漂移
+        sub2_out = [21, 22, 23, 24, 25, 26, 27, 28]  # 更长, 会被全局最长匹配选中
+        for out in (sub1_out, sub2_out):
+            seq = [9, 10] + out
+            self.assertTrue(store.put(session_id, KIND_SUB, seq, make_cache(len(seq)), prompt_len=2))
+
+        prompt = (main_tokens
+                  + [900] + window1_body + [901, 88]
+                  + [900] + sub2_out + [901, 89])
+        grafts = store.build_grafts(session_id, [KIND_MAIN, "sub", "sub", KIND_MAIN], prompt)
+
+        self.assertEqual(len(grafts), 2)
+        self.assertEqual(grafts[0].tokens, [22, 23, 24, 25, 26, 27])
+        self.assertEqual(grafts[0].source_position, 3)  # sub 1 输出区第 2 个 token
+        self.assertEqual(grafts[1].tokens, sub2_out)
+        self.assertEqual(grafts[1].source_position, 2)  # sub 2 输出区起点
+
+    def test_build_grafts_rejects_short_cross_sub_boilerplate_match(self):
+        store = SessionKVStore(config=None, tokenizer=FakeTokenizer())
+        session_id = "s1"
+        main_tokens = [1, 2, 3]
+        self.assertTrue(store.put(session_id, KIND_MAIN, main_tokens, make_cache(3), prompt_len=3))
+
+        # 窗口正文属于未保存 KV 的 sub(如请求被截断); 剩余 sub 只与窗口共享
+        # 4 个样板 token, 达不到覆盖率门槛, 不得误拼。
+        body = list(range(300, 320))  # 20 tok
+        other_out = [21, 22] + [301, 302, 303, 304] + [23, 24]
+        self.assertTrue(store.put(session_id, KIND_SUB, [9, 10] + other_out,
+                                  make_cache(10), prompt_len=2))
+
+        prompt = main_tokens + [900] + body + [901]
+        grafts = store.build_grafts(session_id, [KIND_MAIN, "sub", KIND_MAIN], prompt)
+
+        self.assertEqual(grafts, [])
+
     def test_new_main_clears_previous_sub_batch(self):
         store = SessionKVStore(config=None, tokenizer=FakeTokenizer())
         session_id = "s1"

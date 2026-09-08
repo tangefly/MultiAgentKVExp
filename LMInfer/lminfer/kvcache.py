@@ -67,10 +67,11 @@ TOOL_RESPONSE_OPEN = "<tool_response>"
 TOOL_RESPONSE_CLOSE = "</tool_response>"
 
 # 拼接模式定位参数(见 SessionKVStore.build_grafts):
-GRAFT_HEAD_SLACK = 2    # 窗口内对齐时允许的首部总漂移 token 数(边界 token 与
-                        # 正文首个 token 合并 / 客户端剥离首部空白)
-GRAFT_WINDOW_SLACK = 8  # 包裹标记间窗口长度超出正文长度的容忍上限; 超出说明
-                        # 窗口里混入了其他消息(如多段 tool 消息), 锚点不可靠
+GRAFT_WINDOW_SLACK = 8  # 匹配段之外窗口剩余 token 数的容忍上限: 真匹配只差
+                        # 包裹换行与边界 BPE 合并的少数 token; 超出说明窗口里
+                        # 混入了其他内容, 或匹配到跨 sub 的公共样板文本(不可靠)
+GRAFT_TIE_MARGIN = 2    # 文档序对应 sub 的匹配比全局最长匹配短的容忍 token 数
+                        # (真实匹配因 BPE 边界漂移缩短的尺度); 超出则按全局最长
 GRAFT_MIN_MATCH = 4     # 拼接的最短匹配 token 数(更短可能是误命中, 保守放弃)
 
 
@@ -382,8 +383,18 @@ class SessionKVStore:
         一个 sub agent 的最终输出 KV 作为一个整体候选处理: 每个窗口最多
         产出一个连续 graft 片段。边界上不能匹配的 token 由引擎正常 prefill;
         不把同一个 sub 输出拆成多个 KV 片段。
+
+        子输出开头的 <think> 块(think_len)不会出现在窗口里(客户端回填前
+        已剥离), 从候选中剔除 —— 否则 think 内复述的正文可能先于真正
+        的输出正文被匹配, graft 会取到 think 区域的 KV。
+
+        只接受"真匹配": 匹配段之外窗口剩余的 token 数不得超过
+        GRAFT_WINDOW_SLACK。真匹配的差距只有包裹换行与边界 BPE 合并的
+        几个 token; 跨 sub 的公共样板文本(JSON 键名、套话等)只覆盖窗口
+        的一小部分, 达不到这个门槛。
         """
-        sub_out = sub_seg.tokens[sub_seg.output_start:]
+        out_start = sub_seg.output_start + max(sub_seg.think_len, 0)
+        sub_out = sub_seg.tokens[out_start:]
         if not sub_out:
             logger.info("会话 %s: 子 agent 段没有输出, 无法拼接", session_id)
             return None
@@ -392,7 +403,7 @@ class SessionKVStore:
             return None
 
         # 在 window/sub_out 中找一个最长公共连续片段。未匹配 token 通常是
-        # tool_response 包裹、换行、边界 BPE 合并、thinking 剥离或 eos 差异,
+        # tool_response 包裹、换行、边界 BPE 合并或 eos 差异,
         # 留给 main 上下文正常 prefill。
         index: dict[int, list[int]] = {}
         for j, tok in enumerate(sub_out):
@@ -412,17 +423,22 @@ class SessionKVStore:
             logger.info("会话 %s: 未在窗口中定位到子 agent 输出正文, 放弃该窗口拼接",
                         session_id)
             return None
+        if len(window) - best_k > GRAFT_WINDOW_SLACK:
+            logger.info("会话 %s: 匹配段只覆盖窗口 %d/%d tok, 超出容忍 %d, "
+                        "疑似跨 sub 样板文本, 放弃该窗口拼接",
+                        session_id, best_k, len(window), GRAFT_WINDOW_SLACK)
+            return None
 
         pos = body_start + best_i
         tokens = sub_out[best_j:best_j + best_k]
         cache = slice_cache(
-            tail_cache(sub_seg.cache, sub_seg.output_start + best_j, self._config),
+            tail_cache(sub_seg.cache, out_start + best_j, self._config),
             best_k, self._config)
         logger.info("会话 %s: 定位子 agent 输出 KV 1 段/%d tok(窗口 %d tok, "
-                    "输出 %d tok, think_len %d), 准备插入",
+                    "输出 %d tok, 剔除 think %d tok), 准备插入",
                     session_id, best_k, len(window), len(sub_out), sub_seg.think_len)
         return KVGraft(position=pos, tokens=tokens, cache=cache,
-                       source_position=sub_seg.output_start + best_j)
+                       source_position=out_start + best_j)
 
     def build_grafts(self, session_id: str, trace: list[str],
                      prompt_tokens: list[int]) -> list[KVGraft]:
@@ -431,9 +447,19 @@ class SessionKVStore:
         chat template 渲染 tool 消息时, 客户端回填的子输出正文前后带包裹标记
         (如 Qwen3 的 <tool_response>), 这层标记是 main prompt 相对子请求多出来
         的几个 token。窗口内不能与 sub 最终输出逐位匹配的边界 token 由引擎
-        正常 prefill; 匹配到的最长连续正文片段则插入子请求时算好的 KV。每个
-        tool response 会向后寻找能匹配的 sub 输出; 同一次 sub invocation 的中间
-        KV 在保存时已被最新段覆盖。一个 sub 输出最多生成一个 graft 片段。
+        正常 prefill; 匹配到的最长连续正文片段则插入子请求时算好的 KV。
+
+        每个窗口的候选筛选(见 _match_graft_window / GRAFT_* 常量):
+        - 输出开头的 <think> 块(客户端回填前已剥离)从候选中剔除;
+        - 匹配段之外窗口剩余的 token 数不得超过 GRAFT_WINDOW_SLACK, 防止
+          跨 sub 的公共样板文本(JSON 键名、套话)误配;
+        - 第 k 个窗口优先与第 k 个 sub 段按文档序对应(任务按文档顺序派发):
+          全局最长匹配只比文档序对应的匹配多出 GRAFT_TIE_MARGIN 以内时,
+          仍选文档序对应的 sub —— 真实匹配常因边界 BPE 合并缩短 1-2 个
+          token, 若不锚定文档序, KV 会被换到错误 sub 的上下文。
+
+        同一次 sub invocation 的中间 KV 在保存时已被最新段覆盖。
+        一个 sub 输出最多生成一个 graft 片段。
 
         返回按 prompt 位置升序排列的 KVGraft 列表; 无 sub 段或定位失败时返回空列表.
         """
@@ -485,6 +511,7 @@ class SessionKVStore:
         matched_windows = 0
         sub_i = 0
         for win_idx, (body_start, _close_pos, window) in enumerate(windows, start=1):
+            # 全局最优: 未消费的剩余 sub 段里找最长匹配(窗口与 sub 顺序错位时兜底)
             best_match: KVGraft | None = None
             best_i = -1
             best_tokens = 0
@@ -496,6 +523,19 @@ class SessionKVStore:
                     best_match = candidate
                     best_i = match_i
                     best_tokens = candidate_tokens
+            # 文档序锚定: 第 k 个窗口优先对应第 k 个 sub 段(任务按文档顺序派发)。
+            # 真实匹配常因边界 BPE 合并比全局最长匹配短 1-2 个 token(此时全局
+            # 最长往往来自另一个 sub 的高度重合文本), 差值在容忍内仍选文档序
+            # 对应的 sub, 保证 KV 来源与窗口内容出自同一次调用。
+            ordered_i = win_idx - 1
+            if sub_i <= ordered_i < len(subs):
+                ordered_match = self._match_graft_window(
+                    session_id, subs[ordered_i], window, body_start)
+                if (ordered_match is not None
+                        and best_tokens - len(ordered_match.tokens) <= GRAFT_TIE_MARGIN):
+                    best_match = ordered_match
+                    best_i = ordered_i
+                    best_tokens = len(ordered_match.tokens)
             if best_match is not None:
                 sub_i = best_i + 1
                 matched_windows += 1
