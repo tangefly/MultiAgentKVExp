@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from agent.agent import Agent
-from agent.llm import LLMClient
+from agent.llm import LLMClient, NoSubAgentKVError
 from agent.tools import build_subagent_tools
 
 
@@ -307,6 +307,7 @@ def run_one(sample: Dict[str, Any], index: int, args: argparse.Namespace) -> Dic
 
     print(f"[sample] index={index} query_id={sample['query_id']} docs={len(sample['evidence_docs'])}")
 
+    missing_sub_kv = False
     try:
         pair = main_agent.run_paired(build_task(sample), sample["evidence_docs"])
         for name, branch in pair["branches"].items():
@@ -336,10 +337,31 @@ def run_one(sample: Dict[str, Any], index: int, args: argparse.Namespace) -> Dic
             "branches": {name: {key: branch[key] for key in branch_fields}
                          for name, branch in pair["branches"].items()},
         }
+    except NoSubAgentKVError:
+        missing_sub_kv = True
+        raise
     finally:
-        if args.release_kv and client.session_id:
-            client.release_kv()
-            print("[released kv]")
+        if (args.release_kv or missing_sub_kv) and client.session_id:
+            try:
+                client.release_kv()
+                print("[released kv]")
+            except Exception as exc:
+                print(f"[release warning] {exc!r}")
+
+
+def run_with_kv_retries(sample: Dict[str, Any], index: int, args: argparse.Namespace) -> Dict[str, Any]:
+    for attempt in range(1, 4):
+        try:
+            result = run_one(sample, index, args)
+            result["attempts"] = attempt
+            return result
+        except NoSubAgentKVError as exc:
+            if attempt < 3:
+                print(f"[retry] index={index} missing SubAgent KV; retry {attempt}/2")
+                continue
+            print(f"[skip] index={index} missing SubAgent KV after 3 attempts")
+            return {"index": index, "query_id": sample.get("query_id"),
+                    "skipped": True, "skip_reason": str(exc), "attempts": attempt}
 
 
 def write_jsonl_row(path: Path, row: Dict[str, Any]) -> None:
@@ -380,7 +402,7 @@ def run(args: argparse.Namespace) -> None:
     for ordinal, index in enumerate(indices, start=1):
         print(f"[progress] {ordinal}/{len(indices)}")
         try:
-            result = run_one(samples[index], index, args)
+            result = run_with_kv_retries(samples[index], index, args)
         except Exception as exc:
             if not args.continue_on_error:
                 raise
@@ -402,6 +424,7 @@ def run(args: argparse.Namespace) -> None:
         "num_valid_pairs": sum(row.get("valid_pair", False) for row in results),
         "num_invalid_pairs": sum("branches" in row and not row.get("valid_pair") for row in results),
         "num_errors": sum("error" in row for row in results),
+        "num_skipped": sum(row.get("skipped", False) for row in results),
         "metrics": {name: mean_scores(row["branches"][name] for row in results if row.get("valid_pair"))
                     for name in ("full_prefill", "kv_reuse")},
         "paired_outcomes": dict(Counter(

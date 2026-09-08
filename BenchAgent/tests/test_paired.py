@@ -31,18 +31,19 @@ class PairedAgentTest(unittest.TestCase):
         self.assertEqual(pair["shared_messages"], messages)
         self.assertIsNone(messages[1]["content"])
 
-    def test_incomplete_plan_fails_before_running_subagents(self):
-        agent, client = self.make_agent(count=1)
-        with self.assertRaises(RuntimeError):
-            agent.run_paired("query", ["/doc0", "/doc1"])
-        agent._run_tool.assert_not_called()
-        client.paired_final.assert_not_called()
+    def test_call_count_does_not_limit_execution(self):
+        for count in (0, 1, 3):
+            with self.subTest(count=count):
+                agent, client = self.make_agent(count=count)
+                agent.run_paired("query", ["/doc0", "/doc1"])
+                self.assertEqual(agent._run_tool.call_count, count)
+                client.paired_final.assert_called_once()
 
-    def test_wrong_document_fails_before_running_subagents(self):
+    def test_document_assignment_is_not_validated(self):
         agent, client = self.make_agent()
-        with self.assertRaises(RuntimeError):
-            agent.run_paired("query", ["/other", "/doc1"])
-        agent._run_tool.assert_not_called()
+        agent.run_paired("query", ["/other", "/other"])
+        self.assertEqual(agent._run_tool.call_count, 2)
+        client.paired_final.assert_called_once()
 
 
 class PairedSummaryTest(unittest.TestCase):

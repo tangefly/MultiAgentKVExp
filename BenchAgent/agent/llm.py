@@ -11,6 +11,10 @@ from typing import Any, Dict, List, Optional
 import requests
 
 
+class NoSubAgentKVError(RuntimeError):
+    """No usable SubAgent KV is available for the paired final request."""
+
+
 class LLMClient:
     """极简 OpenAI 兼容 chat 客户端。
 
@@ -142,9 +146,21 @@ class LLMClient:
         if self.enable_thinking is not None:
             payload["enable_thinking"] = self.enable_thinking
             payload["chat_template_kwargs"] = {"enable_thinking": self.enable_thinking}
-        result = self._post(payload)
+        try:
+            result = self._post(payload)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 400:
+                try:
+                    detail = exc.response.json().get("detail", "")
+                except (ValueError, AttributeError):
+                    detail = ""
+                if isinstance(detail, str) and detail.startswith("No SubAgent KV matched the final prompt"):
+                    raise NoSubAgentKVError(detail) from exc
+            raise
         if result.get("object") != "paired.chat.completion":
             raise RuntimeError("Server does not implement paired_final; use this experiment's LMInfer")
+        if result["branches"]["kv_reuse"]["grafted_tokens"] == 0:
+            raise NoSubAgentKVError("No SubAgent KV was actually grafted")
         return result
 
     def release_kv(self):

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, Dict, List, Optional
 
 from .llm import LLMClient
@@ -87,9 +86,7 @@ class Agent:
         raise RuntimeError(f"[{self.name}] 达到最大迭代次数 {self.max_iters}，任务未完成")
 
     def run_paired(self, task: str, documents: List[str]) -> Dict[str, Any]:
-        """One planning batch, one execution per document, then a final-answer fork."""
-        if not documents or len(set(documents)) != len(documents):
-            raise ValueError("Paired experiment requires nonempty unique evidence documents")
+        """Execute the returned planning batch, then fork the final answer."""
         task += ("\n\nPaired experiment protocol: In your first response, issue exactly one "
                  "call_subagent per listed evidence document, all in one batch and in listed order. "
                  "Do not answer yet. After all results return, provide the final JSON answer; "
@@ -98,26 +95,17 @@ class Agent:
         plan = self.llm.chat(messages, tools=self.tools_json, tool_choice="auto",
                              temperature=self.temperature, max_tokens=self.max_tokens, trace=self.trace)
         calls = plan.get("tool_calls") or []
-        if len(calls) != len(documents):
-            raise RuntimeError(f"Expected {len(documents)} SubAgent calls in one batch, got {len(calls)}")
-        parsed = []
-        for i, (call, path) in enumerate(zip(calls, documents)):
-            fn = call.get("function") or {}
-            args = parse_json_arguments(fn.get("arguments"))
-            subtask = args.get("task", "")
-            if (fn.get("name") != "call_subagent" or not isinstance(subtask, str)
-                    or re.findall(r"^document_path: (.+)$", subtask, re.M) != [path]
-                    or re.findall(r"^document_index: (.+)$", subtask, re.M) != [str(i)]):
-                raise RuntimeError(f"Invalid document assignment at index {i}; refusing a confounded pair")
-            parsed.append(args)
         messages.append({"role": "assistant", "content": strip_think(plan.get("content") or "") or None,
                          "tool_calls": calls})
-        for call, args in zip(calls, parsed):
-            result = self._run_tool("call_subagent", args)
+        for call in calls:
+            fn = call.get("function") or {}
+            name = fn.get("name", "")
+            args = parse_json_arguments(fn.get("arguments"))
+            result = self._run_tool(name, args)
             if result.startswith("ERROR:"):
                 raise RuntimeError(result)
             messages.append({"role": "tool", "tool_call_id": call["id"],
-                             "name": "call_subagent", "content": result})
+                             "name": name, "content": result})
         self.trace.append("main")
         pair = self.llm.paired_final(messages, trace=self.trace, temperature=self.temperature,
                                      max_tokens=self.max_tokens)

@@ -29,8 +29,8 @@ python3 /home/tanger/workspace/MultiAgentKVExp/BenchAgent/scripts/browsecomp/run
 
 ## 实验流程
 
-1. MainAgent 只规划一次，首轮必须按文档顺序给全部文档各分配一个 SubAgent。
-   不满足数量或 document_index/document_path 校验时，样本报错，不悄悄改变计划。
+1. MainAgent 只规划一次。提示词建议按文档分配 SubAgent，但客户端直接执行返回的全部工具调用，
+   不校验调用数量与文档数量是否一致，也不校验 document_index/document_path。
 2. 每个 SubAgent 运行一次完整工具循环，默认串行执行。它们与 MainAgent 共用服务端 session；
    LMInfer 保留各 SubAgent 最后一次生成的 token 与 KV。共享阶段可以按服务器配置复用前缀。
 3. 所有结果返回后，客户端调用同一个 chat 接口，携带 `paired_final=true`、`tool_choice=none`。
@@ -39,8 +39,10 @@ python3 /home/tanger/workspace/MultiAgentKVExp/BenchAgent/scripts/browsecomp/run
    - full_prefill：不传任何跨请求前缀或 graft；decode 仍正常使用本次新计算的 KV。
    - kv_reuse：使用 Main 历史的可匹配前缀，以及 SubAgent 输出的可匹配连续 KV 片段。
    引擎深拷贝源缓存后才进行可变计算；两路最终生成均不写回 session KV。
-5. 无可匹配 SubAgent KV 时返回错误；发生 graft 回退或实际 graft 为零时保存结果但标记
-   `valid_pair=false`，不计入有效配对准确度。
+5. 没有可匹配 SubAgent KV，或实际 graft 为零时，释放该次会话 KV 并重跑整个样本，
+   最多额外重试 2 次（共 3 次，每次新会话）。仍失败则保存 skipped/skip_reason/attempts，
+   继续下一个样本，即使设置了 --no-continue-on-error。其他错误沿用 continue-on-error 策略。
+   summary 用 num_skipped 单独计数；跳过样本不计入准确度。温度为 0 时重跑也可能重复失败。
 
 不是所有正文 token 都必然拼接：模板边界、最长连续匹配和 repair 参数可能要求部分重新计算。
 `planned_graft_*` 表示候选量，分支内的 `grafted_*` 表示实际量；
